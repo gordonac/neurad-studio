@@ -280,3 +280,58 @@ def test_py123d_image_paths_survive_a_second_split(mini_log: Path) -> None:
 
     assert all(path.exists() for path in train_paths), "train images deleted by the eval parse"
     assert all(path.exists() for path in val.image_filenames)
+
+
+def test_py123d_georeferenced_poses_keep_their_precision(make_py123d_log) -> None:
+    """The same scene must come out the same whether or not it is georeferenced.
+
+    Real py123d logs are georeferenced, with ego translations of order 1e6 m, where
+    float32 spacing is 0.25 m. Casting poses to float32 in that frame quantizes every
+    camera, lidar and actor pose independently; recentering the scene afterwards cannot
+    recover it. The public example datasets all ship near-zero coordinates, so this is
+    invisible without a log like the one built here.
+    """
+    torch = pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    def parse(origin):
+        log_dir = make_py123d_log(num_samples=6, global_origin=origin)
+        config = Py123dDataParserConfig(
+            data=log_dir.parents[2],
+            log_id="mini_log_001",
+            split="train",
+            cameras=("CAM_FRONT", "CAM_FRONT_LEFT"),
+            lidars=("LIDAR_TOP",),
+            lidar_type=LidarType.VELODYNE_VLP32C,
+            load_cuboids=True,
+            train_split_fraction=1.0,
+        )
+        return Py123dDataParser(config).get_dataparser_outputs("train")
+
+    at_origin = parse((0.0, 0.0, 0.0))
+    georeferenced = parse((3.8e6, 1.2e6, 40.0))
+
+    # Both logs describe the same scene, and the parser recenters on the mean pose, so
+    # every recentered pose must agree. Without the float64 pre-shift the georeferenced
+    # positions are off by ~0.06 m on average.
+    cam_error = (georeferenced.cameras.camera_to_worlds[:, :3, 3] - at_origin.cameras.camera_to_worlds[:, :3, 3]).abs()
+    lidar_error = (
+        georeferenced.metadata["lidars"].lidar_to_worlds[:, :3, 3]
+        - at_origin.metadata["lidars"].lidar_to_worlds[:, :3, 3]
+    ).abs()
+    actor_error = (
+        georeferenced.metadata["trajectories"][0]["poses"][:, :3, 3]
+        - at_origin.metadata["trajectories"][0]["poses"][:, :3, 3]
+    ).abs()
+
+    assert float(cam_error.max()) < 1e-3
+    assert float(lidar_error.max()) < 1e-3
+    assert float(actor_error.max()) < 1e-3
+
+    # dataparser_transform still maps the exporter's global frame into the world frame.
+    transform = georeferenced.dataparser_transform.double()
+    global_pose = torch.tensor([3.8e6, 1.2e6, 40.0, 1.0], dtype=torch.float64)
+    world_pose = transform @ global_pose
+    assert float(world_pose.abs().max()) < 10.0, world_pose

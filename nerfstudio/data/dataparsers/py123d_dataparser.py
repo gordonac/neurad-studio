@@ -166,6 +166,7 @@ class Py123dDataParser(ADDataParser):
         self._image_tmpdir = None
         self._image_dir: Path = Path()
         self._image_paths: Dict[Tuple[str, int], Path] = {}
+        self._pose_origin = np.zeros(3)
 
     @property
     def actor_transform(self) -> torch.Tensor:
@@ -175,7 +176,54 @@ class Py123dDataParser(ADDataParser):
     def _generate_dataparser_outputs(self, split="train"):
         self._load_arrow_tables()
         self._extract_camera_images()
-        return super()._generate_dataparser_outputs(split)
+        self._pose_origin = self._compute_pose_origin()
+        outputs = super()._generate_dataparser_outputs(split)
+        # ``dataparser_transform`` must still map the *exporter's* global frame into the
+        # neurad world frame, so fold the float64 pre-shift back into it.
+        outputs.dataparser_transform = self._compose_origin_shift(outputs.dataparser_transform)
+        return outputs
+
+    def _compute_pose_origin(self) -> np.ndarray:
+        """Pick a float64 origin to subtract from global poses before they become float32.
+
+        py123d logs are georeferenced: in an ECEF-like global frame the ego translation can be
+        ~3.8e6 m from the origin, where float32 spacing is 0.25 m. Casting poses to
+        float32 in that frame -- which is what ``torch.tensor(..., dtype=torch.float32)``
+        below used to do -- quantizes every camera, lidar and actor pose by up to 0.125 m,
+        independently and incoherently per pose. Measured on one such log: 0.064 m mean
+        and 0.126 m max error, i.e. 5-15 px of reprojection jitter at the depths these
+        cameras actually see. A splat optimizer cannot fit that; it can only blur until the
+        result is equally consistent with all the contradictory poses it was given.
+
+        ``ADDataParser._adjust_poses`` does recenter the scene, but only *after* the cast,
+        so it cannot recover precision that has already been thrown away. Subtracting a
+        constant origin in float64 first keeps the float32 mantissa where it is useful
+        (sub-millimeter at scene scale). The shift is a rigid translation common to every
+        pose, so it changes nothing about the scene except its numerical conditioning.
+        """
+        column_name = next(n for n in self._ego_table.column_names if n.endswith(".imu_se3"))
+        return np.asarray(self._ego_table.column(column_name)[0].as_py()[:3], dtype=np.float64)
+
+    def _recenter(self, pose: np.ndarray) -> np.ndarray:
+        """Return a copy of a 4x4 global pose with the float64 pose origin subtracted."""
+        pose = np.array(pose, dtype=np.float64, copy=True)
+        pose[:3, 3] -= self._pose_origin
+        return pose
+
+    def _compose_origin_shift(self, world_from_shifted: torch.Tensor) -> torch.Tensor:
+        """Compose the float64 pre-shift into a 3x4 transform so it accepts global poses.
+
+        Note the result is still a float32 tensor holding a ~3.8e6 m translation, so it
+        can only express the global -> world mapping to about 0.25 m. That is a property of
+        ``DataparserOutputs.dataparser_transform``'s dtype and was equally true before the
+        pre-shift; it affects only consumers that feed it raw georeferenced coordinates
+        (``scripts/closed_loop/server.py``, ``dataparser_transforms.json``), never the poses
+        used for training, which are now correct to well under a millimeter.
+        """
+        rot = world_from_shifted[:3, :3].double()
+        trans = world_from_shifted[:3, 3].double()
+        origin = torch.from_numpy(self._pose_origin)
+        return torch.cat([rot, (trans - rot @ origin).unsqueeze(-1)], dim=-1).to(world_from_shifted.dtype)
 
     def _load_arrow_tables(self) -> None:
         log_dir = self.config.data / "logs" / self.config.split / self.config.log_id
@@ -291,7 +339,7 @@ class Py123dDataParser(ADDataParser):
                     # legitimately differ.
                     continue
                 row_idx = int(row_ref)
-                pose = pose_list_to_matrix(pose_column[row_idx].as_py())
+                pose = self._recenter(pose_list_to_matrix(pose_column[row_idx].as_py()))
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
                 anchor_ts_us = timestamp_column[row_idx].as_py()
@@ -370,7 +418,7 @@ class Py123dDataParser(ADDataParser):
                 row_idx = int(row_ref)
                 ego_row_idx = int(ego_row_ref)
                 ego_pose = pose_list_to_matrix(ego_pose_column[ego_row_idx].as_py())
-                lidar_pose = ego_pose @ self._lidar_to_imu
+                lidar_pose = self._recenter(ego_pose @ self._lidar_to_imu)
 
                 filenames.append(lidar_row_path(row_idx))
                 poses.append(lidar_pose)
@@ -437,7 +485,9 @@ class Py123dDataParser(ADDataParser):
                 if not track_token:
                     continue
                 box = bounding_box_se3_from_list(box_values)
-                pose = box.center_se3.transformation_matrix @ WLH_TO_LWH
+                # Boxes are in the same georeferenced global frame as the sensor poses, so
+                # they need the same float64 pre-shift before being cast to float32 below.
+                pose = self._recenter(box.center_se3.transformation_matrix) @ WLH_TO_LWH
                 # neurad dims are documented as wlh; py123d stores length/width/height.
                 wlh = np.array([box.width, box.length, box.height], dtype=np.float32)
                 category = box_label_to_category(self._box_label_class, int(label_value))
