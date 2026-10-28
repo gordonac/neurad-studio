@@ -252,3 +252,31 @@ def test_py123d_handles_null_sync_references(make_py123d_log) -> None:
     assert all(path.exists() for path in outputs.image_filenames)
     assert outputs.metadata["lidars"].shape[0] == 2
     assert len(outputs.metadata["point_clouds"]) == 2
+
+
+def test_py123d_image_paths_survive_a_second_split(mini_log: Path) -> None:
+    """Paths handed out for one split must still be readable after the next split parses."""
+    pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    config = Py123dDataParserConfig(
+        data=mini_log.parents[2],
+        log_id="mini_log_001",
+        split="train",
+        cameras=("CAM_FRONT",),
+        lidars=("LIDAR_TOP",),
+        lidar_type=LidarType.VELODYNE_VLP32C,
+        train_split_fraction=0.5,
+    )
+    parser = Py123dDataParser(config)
+
+    train = parser.get_dataparser_outputs("train")
+    train_paths = list(train.image_filenames)
+    assert train_paths and all(path.exists() for path in train_paths)
+
+    val = parser.get_dataparser_outputs("val")
+
+    assert all(path.exists() for path in train_paths), "train images deleted by the eval parse"
+    assert all(path.exists() for path in val.image_filenames)

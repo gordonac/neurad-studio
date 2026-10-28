@@ -232,8 +232,13 @@ class Py123dDataParser(ADDataParser):
 
         # Keep TemporaryDirectory alive for the parser lifetime so images remain
         # readable, then clean up automatically when the parser is discarded.
-        self._image_tmpdir = tempfile.TemporaryDirectory(prefix="py123d_images_")
-        self._image_dir = Path(self._image_tmpdir.name)
+        # Allocate it only once: _load_arrow_tables() runs again for every split,
+        # and rebinding this attribute would drop the previous TemporaryDirectory,
+        # deleting images whose paths were already handed to an earlier split's
+        # DataparserOutputs (train paths die when the eval split is generated).
+        if getattr(self, "_image_tmpdir", None) is None:
+            self._image_tmpdir = tempfile.TemporaryDirectory(prefix="py123d_images_")
+            self._image_dir = Path(self._image_tmpdir.name)
 
     def _extract_camera_images(self) -> None:
         """Extract image payloads for rows referenced by ``sync.arrow``."""
