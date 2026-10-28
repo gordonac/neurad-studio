@@ -120,6 +120,23 @@ class Py123dDataParserConfig(ADDataParserConfig):
     """Horizontal lidar beam divergence used for rendering metadata."""
     vertical_beam_divergence: float = 1.5e-3
     """Vertical lidar beam divergence used for rendering metadata."""
+    lidar_sensor_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Translation from the frame the lidar points are *stored* in to the physical sensor origin.
+
+    Some exporters emit a merged-lidar modality whose points have already been transformed into
+    the ego/IMU frame, and then report ``lidar_to_imu_se3`` as identity. That is self-consistent in
+    world space, but neurad derives each point's azimuth/elevation/range from the raw point
+    coordinates and bins the returns into a range image using a physical beam table
+    (``get_lidar_elevation_mapping``). Those angles are only the sensor's beam angles if the
+    points are expressed about the sensor origin, so an ego-frame export silently produces
+    elevations that match no beam table and a scrambled range image.
+
+    Set this to the sensor origin expressed in the stored frame. Points are shifted into the
+    sensor frame and the same translation is folded into ``lidar_to_world``, so world-space
+    geometry is unchanged -- only the spherical binning is corrected. Rotation is deliberately
+    not modeled: a constant yaw is a cyclic shift of a full 360 degree sweep and does not
+    affect which elevation row a return lands in.
+    """
     use_capture_timestamps: bool = True
     """Use per-camera capture timestamps from an optional custom modality sidecar."""
     capture_metadata_modality: str = DEFAULT_CAPTURE_METADATA_MODALITY
@@ -418,7 +435,9 @@ class Py123dDataParser(ADDataParser):
                 row_idx = int(row_ref)
                 ego_row_idx = int(ego_row_ref)
                 ego_pose = pose_list_to_matrix(ego_pose_column[ego_row_idx].as_py())
-                lidar_pose = self._recenter(ego_pose @ self._lidar_to_imu)
+                # Fold the stored-frame -> sensor-origin translation into the pose, so that
+                # shifting the points in _read_lidars leaves world-space geometry identical.
+                lidar_pose = self._recenter(ego_pose @ self._lidar_to_imu @ self._sensor_offset_matrix())
 
                 filenames.append(lidar_row_path(row_idx))
                 poses.append(lidar_pose)
@@ -441,8 +460,15 @@ class Py123dDataParser(ADDataParser):
         )
         return lidars, filenames
 
+    def _sensor_offset_matrix(self) -> np.ndarray:
+        """Translation-only transform from the sensor frame to the stored point frame."""
+        offset = np.eye(4)
+        offset[:3, 3] = np.asarray(self.config.lidar_sensor_offset, dtype=np.float64)
+        return offset
+
     def _read_lidars(self, lidars: Lidars, filepaths: List[Path]) -> List[torch.Tensor]:
         point_clouds: List[torch.Tensor] = []
+        offset = torch.tensor(self.config.lidar_sensor_offset, dtype=torch.float32)
         data_column = modality_data_column(self._lidar_table)
         timestamp_column = modality_timestamp_column(self._lidar_table)
         end_timestamp_column = modality_end_timestamp_column(self._lidar_table)
@@ -456,6 +482,12 @@ class Py123dDataParser(ADDataParser):
             # lidar_ipc_to_numpy already returns relative sweep time offsets in
             # [-sweep_duration, 0]; do not subtract absolute lidar timestamps.
             pc = torch.from_numpy(lidar_ipc_to_numpy(data_column[row_idx].as_py(), sweep_duration_s))
+            # Express points about the physical sensor origin so that the azimuth / elevation /
+            # range the lidar rasteriser computes are the sensor's real beam angles. The same
+            # translation is applied to lidar_to_world in _get_lidars, so this is a change of
+            # reference frame only, not of world-space geometry.
+            if torch.any(offset != 0):
+                pc[:, :3] -= offset
             point_clouds.append(pc)
 
         return point_clouds

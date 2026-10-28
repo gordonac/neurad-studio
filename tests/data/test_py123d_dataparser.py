@@ -335,3 +335,57 @@ def test_py123d_georeferenced_poses_keep_their_precision(make_py123d_log) -> Non
     global_pose = torch.tensor([3.8e6, 1.2e6, 40.0, 1.0], dtype=torch.float64)
     world_pose = transform @ global_pose
     assert float(world_pose.abs().max()) < 10.0, world_pose
+
+
+def test_py123d_lidar_sensor_offset_is_a_frame_change_only(mini_log: Path) -> None:
+    """`lidar_sensor_offset` must move points into the sensor frame without moving the world."""
+    torch = pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    offset = (0.0, 0.0, 1.5)
+
+    def parse(lidar_sensor_offset):
+        config = Py123dDataParserConfig(
+            data=mini_log.parents[2],
+            log_id="mini_log_001",
+            split="train",
+            cameras=("CAM_FRONT",),
+            lidars=("LIDAR_TOP",),
+            lidar_type=LidarType.VELODYNE_VLP32C,
+            lidar_sensor_offset=lidar_sensor_offset,
+            train_split_fraction=1.0,
+        )
+        return Py123dDataParser(config).get_dataparser_outputs("train")
+
+    stored_frame = parse((0.0, 0.0, 0.0))
+    sensor_frame = parse(offset)
+
+    offset_tensor = torch.tensor(offset)
+    for stored_pc, sensor_pc in zip(stored_frame.metadata["point_clouds"], sensor_frame.metadata["point_clouds"]):
+        # The points themselves are shifted into the sensor frame...
+        assert torch.allclose(sensor_pc[:, :3], stored_pc[:, :3] - offset_tensor, atol=1e-6)
+
+    def world_points(outputs):
+        """Points in world space, relative to the first camera of that parse.
+
+        Each parse recenters the scene on its own mean pose, so an absolute comparison
+        would only measure that recentering. The cameras are untouched by the lidar
+        offset, so camera 0 is the fixed landmark; the lidar origin is not, since moving
+        it to the physical sensor is the whole point of the config field.
+        """
+        lidar_to_worlds = outputs.metadata["lidars"].lidar_to_worlds
+        anchor = outputs.cameras.camera_to_worlds[0, :3, 3]
+        out = []
+        for idx, pc in enumerate(outputs.metadata["point_clouds"]):
+            rotation = lidar_to_worlds[idx, :3, :3]
+            translation = lidar_to_worlds[idx, :3, 3]
+            out.append(pc[:, :3] @ rotation.T + translation - anchor)
+        return torch.cat(out)
+
+    assert torch.allclose(world_points(sensor_frame), world_points(stored_frame), atol=1e-5)
+
+    # And the default leaves both the points and the poses untouched.
+    default = parse((0.0, 0.0, 0.0))
+    assert torch.allclose(default.metadata["lidars"].lidar_to_worlds, stored_frame.metadata["lidars"].lidar_to_worlds)
