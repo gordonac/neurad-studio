@@ -103,11 +103,21 @@ def _lidar_ipc_bytes(num_points: int = 32) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
-def build_mini_py123d_log(data_root: Path, *, num_samples: int = NUM_SAMPLES) -> Path:
+def build_mini_py123d_log(
+    data_root: Path,
+    *,
+    num_samples: int = NUM_SAMPLES,
+    null_sync_samples: Dict[str, Sequence[int]] | None = None,
+) -> Path:
     """Write a tiny synthetic py123d log under ``data_root/logs/{split}/{log_id}/``.
 
     Returns the log directory path. Clears py123d's log-metadata LRU cache so the
     new files are visible to subsequent ``parse_log_directory_metadata`` calls.
+
+    ``null_sync_samples`` leaves a modality's ``sync.arrow`` entry null for the given
+    sample indices, which is what a real log looks like when sensors capture at
+    staggered rates and a synchronized sample has no frame from one of them. Keys are
+    camera names from ``CAMERAS`` or the literal ``"lidar"``.
     """
     log_dir = data_root / "logs" / MINI_SPLIT / MINI_LOG_ID
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +268,13 @@ def build_mini_py123d_log(data_root: Path, *, num_samples: int = NUM_SAMPLES) ->
     for metadata in camera_meta.values():
         sync_cols[metadata.modality_key] = list(range(num_samples))
 
+    for key, sample_idxs in (null_sync_samples or {}).items():
+        column = "lidar.lidar_merged" if key == "lidar" else camera_meta[key].modality_key
+        values = list(sync_cols[column])
+        for sample_idx in sample_idxs:
+            values[sample_idx] = None
+        sync_cols[column] = values
+
     arrays = {
         "sync.uuid": pa.array(sync_cols["sync.uuid"], type=pa.uuid()),
         "sync.timestamp_us": pa.array(sync_cols["sync.timestamp_us"], type=pa.int64()),
@@ -286,3 +303,13 @@ def mini_log(tmp_path_factory) -> Path:
     """Module-scoped synthetic py123d log directory."""
     root = tmp_path_factory.mktemp("py123d_data")
     return build_mini_py123d_log(root)
+
+
+@pytest.fixture
+def make_py123d_log(tmp_path_factory):
+    """Build a synthetic log with non-default options, each in its own directory."""
+
+    def _make(**kwargs) -> Path:
+        return build_mini_py123d_log(tmp_path_factory.mktemp("py123d_data"), **kwargs)
+
+    return _make

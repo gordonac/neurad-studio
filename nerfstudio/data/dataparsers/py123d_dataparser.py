@@ -241,10 +241,12 @@ class Py123dDataParser(ADDataParser):
             modality_key = self._camera_name_to_modality[camera_name]
             table = self._camera_tables[modality_key]
             data_column = modality_data_column(table)
-            needed_rows = {
-                int(self._sync_table.column(modality_key)[sync_row].as_py())
-                for sync_row in iter_sync_rows(self._sync_table)
-            }
+            needed_rows = set()
+            for sync_row in iter_sync_rows(self._sync_table):
+                row_ref = self._sync_table.column(modality_key)[sync_row].as_py()
+                if row_ref is None:
+                    continue  # sample has no frame from this camera; see _get_cameras
+                needed_rows.add(int(row_ref))
             for row_idx in sorted(needed_rows):
                 image_bytes = data_column[row_idx].as_py()
                 if not image_bytes:
@@ -275,7 +277,15 @@ class Py123dDataParser(ADDataParser):
             assert pose_column is not None
 
             for sync_row in iter_sync_rows(self._sync_table):
-                row_idx = int(self._sync_table.column(modality_key)[sync_row].as_py())
+                row_ref = self._sync_table.column(modality_key)[sync_row].as_py()
+                if row_ref is None:
+                    # sync.arrow leaves a modality's entry null when the sample has no
+                    # data for it -- e.g. the final sample of a snippet, which carries a
+                    # lidar sweep but no images. Skip rather than fail: sensor entries
+                    # are a flat list tagged by sensor_idxs, so per-camera counts may
+                    # legitimately differ.
+                    continue
+                row_idx = int(row_ref)
                 pose = pose_list_to_matrix(pose_column[row_idx].as_py())
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
@@ -348,8 +358,12 @@ class Py123dDataParser(ADDataParser):
         ego_column_name = "ego_state_se3"
         for lidar_idx, _lidar_name in enumerate(self.config.lidars):
             for sync_row in iter_sync_rows(self._sync_table):
-                row_idx = int(self._sync_table.column(self._lidar_modality_key)[sync_row].as_py())
-                ego_row_idx = int(self._sync_table.column(ego_column_name)[sync_row].as_py())
+                row_ref = self._sync_table.column(self._lidar_modality_key)[sync_row].as_py()
+                ego_row_ref = self._sync_table.column(ego_column_name)[sync_row].as_py()
+                if row_ref is None or ego_row_ref is None:
+                    continue  # no sweep (or no ego pose) for this sample; see _get_cameras
+                row_idx = int(row_ref)
+                ego_row_idx = int(ego_row_ref)
                 ego_pose = pose_list_to_matrix(ego_pose_column[ego_row_idx].as_py())
                 lidar_pose = ego_pose @ self._lidar_to_imu
 

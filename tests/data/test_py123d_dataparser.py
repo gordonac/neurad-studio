@@ -219,3 +219,36 @@ def test_py123d_per_camera_capture_timestamps(mini_log: Path) -> None:
     assert not torch.allclose(capture_f, anchor_f)
     delta_ms = (capture_f - anchor_f).abs() * 1e3
     assert float(delta_ms.mean()) == pytest.approx(10.0, abs=0.1)
+
+
+def test_py123d_handles_null_sync_references(make_py123d_log) -> None:
+    """A sample with no frame from one sensor must be skipped, not crash the parse.
+
+    ``sync.arrow`` entries are null whenever a synchronized sample has no data for that
+    modality. One camera effectively defines the sync grid and never produces a null;
+    several cameras at staggered capture rates produce them routinely.
+    """
+    pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    log_dir = make_py123d_log(null_sync_samples={"CAM_FRONT_LEFT": [2], "lidar": [0]})
+    config = Py123dDataParserConfig(
+        data=log_dir.parents[2],
+        log_id="mini_log_001",
+        split="train",
+        cameras=("CAM_FRONT", "CAM_FRONT_LEFT"),
+        lidars=("LIDAR_TOP",),
+        lidar_type=LidarType.VELODYNE_VLP32C,
+        train_split_fraction=1.0,
+    )
+    parser = Py123dDataParser(config)  # the images live as long as the parser does
+    outputs = parser.get_dataparser_outputs("train")
+
+    # 3 CAM_FRONT frames + 2 CAM_FRONT_LEFT frames, and 2 of 3 lidar sweeps.
+    assert len(outputs.image_filenames) == 5
+    assert outputs.cameras.shape[0] == 5
+    assert all(path.exists() for path in outputs.image_filenames)
+    assert outputs.metadata["lidars"].shape[0] == 2
+    assert len(outputs.metadata["point_clouds"]) == 2
