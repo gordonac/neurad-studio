@@ -451,7 +451,11 @@ class Py123dDataParser(ADDataParser):
         lidars = Lidars(
             lidar_to_worlds=poses_tensor[:, :3, :4],
             lidar_type=self.config.lidar_type,
-            assume_ego_compensated=False,
+            # The points are already ego-motion compensated: the producer moves every point to where it
+            # would have been had the whole sweep been captured at the cloud timestamp. Lidars offsets the
+            # ray *origin* by dt * velocity either way, which is correct, but with this flag False it also
+            # offsets the *points*, removing the same ego motion a second time.
+            assume_ego_compensated=True,
             times=times_tensor,
             metadata={"sensor_idxs": idxs_tensor},
             horizontal_beam_divergence=self.config.horizontal_beam_divergence,
