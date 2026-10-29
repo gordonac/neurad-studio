@@ -107,6 +107,34 @@ def test_mini_log_camera_metadata_and_lidar_decode(mini_log: Path) -> None:
     assert points.shape[0] > 0
 
 
+def test_lidar_point_times_are_built_per_sensor(make_lidar_ipc_bytes) -> None:
+    """Every sensor in a merged cloud spins across the whole sweep, so every sensor gets the whole ramp.
+
+    A merged modality stores one sensor's points after another's. Ramping across the concatenation
+    gives the first sensor the start of the sweep and the last sensor only its final milliseconds --
+    here, with 40 + 10 + 25 points, sensor 2 would be stamped within the last 17 ms of a 50 ms sweep.
+    """
+    points_per_sensor = (40, 10, 25)
+    sweep_duration_s = 0.05
+    points = lidar_ipc_to_numpy(make_lidar_ipc_bytes(points_per_sensor), sweep_duration_s=sweep_duration_s)
+
+    assert points.shape[0] == sum(points_per_sensor)
+    times = points[:, 4]
+    start = 0
+    for count in points_per_sensor:
+        block = times[start : start + count]
+        assert block.min() == pytest.approx(-sweep_duration_s)
+        assert block.max() == pytest.approx(0.0)
+        assert np.all(np.diff(block) > 0), "times must still advance with firing order within a sensor"
+        start += count
+
+
+def test_lidar_point_times_unchanged_for_a_single_sensor(make_lidar_ipc_bytes) -> None:
+    """One sensor, or no ``ids`` column at all, keeps the plain uniform ramp."""
+    points = lidar_ipc_to_numpy(make_lidar_ipc_bytes(num_points=8), sweep_duration_s=0.05)
+    np.testing.assert_allclose(points[:, 4], np.linspace(-0.05, 0.0, 8), atol=1e-7)
+
+
 def test_py123d_dataparser_smoke(mini_log: Path) -> None:
     torch = pytest.importorskip("torch")
 

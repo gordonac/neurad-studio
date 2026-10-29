@@ -114,9 +114,8 @@ def find_lidar_entry(
     raise KeyError(f"Lidar '{lidar_name}' not found in merged metadata. Available: {available}")
 
 
-def decode_lidar_ipc(data: bytes) -> np.ndarray:
-    """Decode embedded lidar IPC bytes to ``[x, y, z, intensity, channel]``."""
-    table = pa.ipc.open_stream(data).read_all()
+def _point_columns(table: pa.Table) -> np.ndarray:
+    """Stack a decoded lidar table's point columns into ``[x, y, z, intensity, channel]``."""
     x = table.column("x").to_numpy().astype(np.float32, copy=False)
     y = table.column("y").to_numpy().astype(np.float32, copy=False)
     z = table.column("z").to_numpy().astype(np.float32, copy=False)
@@ -125,16 +124,48 @@ def decode_lidar_ipc(data: bytes) -> np.ndarray:
     return np.stack([x, y, z, intensity, channel], axis=1)
 
 
+def decode_lidar_ipc(data: bytes) -> np.ndarray:
+    """Decode embedded lidar IPC bytes to ``[x, y, z, intensity, channel]``."""
+    return _point_columns(pa.ipc.open_stream(data).read_all())
+
+
+def sweep_time_offsets(table: pa.Table, num_points: int, sweep_duration_s: float) -> np.ndarray:
+    """Synthesize per-point times in ``[-sweep_duration_s, 0]``, one ramp per sensor.
+
+    py123d stores a merged lidar modality as a single point cloud with a per-point sensor index in
+    its optional ``ids`` column (``LidarFeature.IDS``). Every sensor in the merge spins across the
+    *whole* sweep, but the points of each are stored contiguously, one sensor's block after another.
+    A single ramp across the concatenation would therefore hand the first sensor the start of the
+    sweep and the last sensor only its final milliseconds -- for a 50 ms sweep of five sensors, a
+    timing error of tens of milliseconds, which is tens of centimeters of ego motion at urban speed.
+    The error is silent: the points are in the right places, only stamped at the wrong times.
+
+    With no ``ids`` column, or a single sensor in it, this is exactly the old uniform ramp.
+    """
+    ids = table.column("ids").to_numpy() if "ids" in table.column_names else None
+    if ids is None:
+        return np.linspace(-sweep_duration_s, 0.0, num_points, dtype=np.float32)
+    sensor_ids = np.unique(ids)
+    if len(sensor_ids) < 2:
+        return np.linspace(-sweep_duration_s, 0.0, num_points, dtype=np.float32)
+    time_offsets = np.empty(num_points, dtype=np.float32)
+    for sensor_id in sensor_ids:
+        mask = ids == sensor_id
+        time_offsets[mask] = np.linspace(-sweep_duration_s, 0.0, int(mask.sum()), dtype=np.float32)
+    return time_offsets
+
+
 def lidar_ipc_to_numpy(
     data: bytes,
     sweep_duration_s: float,
 ) -> np.ndarray:
     """Decode lidar IPC bytes to neurad array format ``[x, y, z, intensity, time, channel]``."""
-    points = decode_lidar_ipc(data)
+    table = pa.ipc.open_stream(data).read_all()
+    points = _point_columns(table)
     num_points = points.shape[0]
     if num_points == 0:
         return np.zeros((0, 6), dtype=np.float32)
-    time_offsets = np.linspace(-sweep_duration_s, 0.0, num_points, dtype=np.float32)
+    time_offsets = sweep_time_offsets(table, num_points, sweep_duration_s)
     return np.concatenate([points[:, :4], time_offsets[:, None], points[:, 4:5]], axis=1).astype(np.float32)
 
 

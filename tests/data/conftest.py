@@ -19,7 +19,7 @@ from __future__ import annotations
 import io
 import uuid
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -75,7 +75,19 @@ def _jpeg_bytes(seed: int) -> bytes:
     return buf.getvalue()
 
 
-def _lidar_ipc_bytes(num_points: int = 32) -> bytes:
+def _lidar_ipc_bytes(num_points: int = 32, points_per_sensor: Optional[Sequence[int]] = None) -> bytes:
+    """Encode a lidar sweep as py123d does: one merged cloud, ``ids`` holding the sensor index.
+
+    ``points_per_sensor`` writes several sensors' points as contiguous blocks, one block per sensor,
+    which is how a merged multi-sensor modality is laid out. The default is a single sensor.
+    """
+    if points_per_sensor is not None:
+        num_points = int(sum(points_per_sensor))
+        sensor_ids = np.concatenate(
+            [np.full(count, sensor_id, dtype=np.uint8) for sensor_id, count in enumerate(points_per_sensor)]
+        )
+    else:
+        sensor_ids = np.zeros(num_points, dtype=np.uint8)
     xyz = np.stack(
         [
             np.linspace(1.0, 10.0, num_points, dtype=np.float32),
@@ -86,7 +98,6 @@ def _lidar_ipc_bytes(num_points: int = 32) -> bytes:
     )
     intensity = np.full(num_points, 128, dtype=np.uint8)
     channel = np.zeros(num_points, dtype=np.uint16)
-    ids = np.arange(num_points, dtype=np.int32)
     table = pa.table(
         {
             "x": xyz[:, 0],
@@ -94,7 +105,7 @@ def _lidar_ipc_bytes(num_points: int = 32) -> bytes:
             "z": xyz[:, 2],
             "intensity": intensity,
             "channel": channel,
-            "ids": ids,
+            "ids": sensor_ids,
         }
     )
     sink = pa.BufferOutputStream()
@@ -335,5 +346,15 @@ def make_py123d_log(tmp_path_factory):
 
     def _make(**kwargs) -> Path:
         return build_mini_py123d_log(tmp_path_factory.mktemp("py123d_data"), **kwargs)
+
+    return _make
+
+
+@pytest.fixture
+def make_lidar_ipc_bytes():
+    """Encode one lidar sweep, optionally as several sensors' points in contiguous blocks."""
+
+    def _make(points_per_sensor: Optional[Sequence[int]] = None, num_points: int = 32) -> bytes:
+        return _lidar_ipc_bytes(num_points=num_points, points_per_sensor=points_per_sensor)
 
     return _make
