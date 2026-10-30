@@ -107,6 +107,34 @@ def test_mini_log_camera_metadata_and_lidar_decode(mini_log: Path) -> None:
     assert points.shape[0] > 0
 
 
+def test_lidar_point_times_are_built_per_sensor(make_lidar_ipc_bytes) -> None:
+    """Every sensor in a merged cloud spins across the whole sweep, so every sensor gets the whole ramp.
+
+    A merged modality stores one sensor's points after another's. Ramping across the concatenation
+    gives the first sensor the start of the sweep and the last sensor only its final milliseconds --
+    here, with 40 + 10 + 25 points, sensor 2 would be stamped within the last 17 ms of a 50 ms sweep.
+    """
+    points_per_sensor = (40, 10, 25)
+    sweep_duration_s = 0.05
+    points = lidar_ipc_to_numpy(make_lidar_ipc_bytes(points_per_sensor), sweep_duration_s=sweep_duration_s)
+
+    assert points.shape[0] == sum(points_per_sensor)
+    times = points[:, 4]
+    start = 0
+    for count in points_per_sensor:
+        block = times[start : start + count]
+        assert block.min() == pytest.approx(-sweep_duration_s)
+        assert block.max() == pytest.approx(0.0)
+        assert np.all(np.diff(block) > 0), "times must still advance with firing order within a sensor"
+        start += count
+
+
+def test_lidar_point_times_unchanged_for_a_single_sensor(make_lidar_ipc_bytes) -> None:
+    """One sensor, or no ``ids`` column at all, keeps the plain uniform ramp."""
+    points = lidar_ipc_to_numpy(make_lidar_ipc_bytes(num_points=8), sweep_duration_s=0.05)
+    np.testing.assert_allclose(points[:, 4], np.linspace(-0.05, 0.0, 8), atol=1e-7)
+
+
 def test_py123d_dataparser_smoke(mini_log: Path) -> None:
     torch = pytest.importorskip("torch")
 
@@ -219,3 +247,173 @@ def test_py123d_per_camera_capture_timestamps(mini_log: Path) -> None:
     assert not torch.allclose(capture_f, anchor_f)
     delta_ms = (capture_f - anchor_f).abs() * 1e3
     assert float(delta_ms.mean()) == pytest.approx(10.0, abs=0.1)
+
+
+def test_py123d_handles_null_sync_references(make_py123d_log) -> None:
+    """A sample with no frame from one sensor must be skipped, not crash the parse.
+
+    ``sync.arrow`` entries are null whenever a synchronized sample has no data for that
+    modality. One camera effectively defines the sync grid and never produces a null;
+    several cameras at staggered capture rates produce them routinely.
+    """
+    pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    log_dir = make_py123d_log(null_sync_samples={"CAM_FRONT_LEFT": [2], "lidar": [0]})
+    config = Py123dDataParserConfig(
+        data=log_dir.parents[2],
+        log_id="mini_log_001",
+        split="train",
+        cameras=("CAM_FRONT", "CAM_FRONT_LEFT"),
+        lidars=("LIDAR_TOP",),
+        lidar_type=LidarType.VELODYNE_VLP32C,
+        train_split_fraction=1.0,
+    )
+    parser = Py123dDataParser(config)  # the images live as long as the parser does
+    outputs = parser.get_dataparser_outputs("train")
+
+    # 3 CAM_FRONT frames + 2 CAM_FRONT_LEFT frames, and 2 of 3 lidar sweeps.
+    assert len(outputs.image_filenames) == 5
+    assert outputs.cameras.shape[0] == 5
+    assert all(path.exists() for path in outputs.image_filenames)
+    assert outputs.metadata["lidars"].shape[0] == 2
+    assert len(outputs.metadata["point_clouds"]) == 2
+
+
+def test_py123d_image_paths_survive_a_second_split(mini_log: Path) -> None:
+    """Paths handed out for one split must still be readable after the next split parses."""
+    pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    config = Py123dDataParserConfig(
+        data=mini_log.parents[2],
+        log_id="mini_log_001",
+        split="train",
+        cameras=("CAM_FRONT",),
+        lidars=("LIDAR_TOP",),
+        lidar_type=LidarType.VELODYNE_VLP32C,
+        train_split_fraction=0.5,
+    )
+    parser = Py123dDataParser(config)
+
+    train = parser.get_dataparser_outputs("train")
+    train_paths = list(train.image_filenames)
+    assert train_paths and all(path.exists() for path in train_paths)
+
+    val = parser.get_dataparser_outputs("val")
+
+    assert all(path.exists() for path in train_paths), "train images deleted by the eval parse"
+    assert all(path.exists() for path in val.image_filenames)
+
+
+def test_py123d_georeferenced_poses_keep_their_precision(make_py123d_log) -> None:
+    """The same scene must come out the same whether or not it is georeferenced.
+
+    Real py123d logs are georeferenced, with ego translations of order 1e6 m, where
+    float32 spacing is 0.25 m. Casting poses to float32 in that frame quantizes every
+    camera, lidar and actor pose independently; recentering the scene afterwards cannot
+    recover it. The public example datasets all ship near-zero coordinates, so this is
+    invisible without a log like the one built here.
+    """
+    torch = pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    def parse(origin):
+        log_dir = make_py123d_log(num_samples=6, global_origin=origin)
+        config = Py123dDataParserConfig(
+            data=log_dir.parents[2],
+            log_id="mini_log_001",
+            split="train",
+            cameras=("CAM_FRONT", "CAM_FRONT_LEFT"),
+            lidars=("LIDAR_TOP",),
+            lidar_type=LidarType.VELODYNE_VLP32C,
+            load_cuboids=True,
+            train_split_fraction=1.0,
+        )
+        return Py123dDataParser(config).get_dataparser_outputs("train")
+
+    at_origin = parse((0.0, 0.0, 0.0))
+    georeferenced = parse((3.8e6, 1.2e6, 40.0))
+
+    # Both logs describe the same scene, and the parser recenters on the mean pose, so
+    # every recentered pose must agree. Without the float64 pre-shift the georeferenced
+    # positions are off by ~0.06 m on average.
+    cam_error = (georeferenced.cameras.camera_to_worlds[:, :3, 3] - at_origin.cameras.camera_to_worlds[:, :3, 3]).abs()
+    lidar_error = (
+        georeferenced.metadata["lidars"].lidar_to_worlds[:, :3, 3]
+        - at_origin.metadata["lidars"].lidar_to_worlds[:, :3, 3]
+    ).abs()
+    actor_error = (
+        georeferenced.metadata["trajectories"][0]["poses"][:, :3, 3]
+        - at_origin.metadata["trajectories"][0]["poses"][:, :3, 3]
+    ).abs()
+
+    assert float(cam_error.max()) < 1e-3
+    assert float(lidar_error.max()) < 1e-3
+    assert float(actor_error.max()) < 1e-3
+
+    # dataparser_transform still maps the exporter's global frame into the world frame.
+    transform = georeferenced.dataparser_transform.double()
+    global_pose = torch.tensor([3.8e6, 1.2e6, 40.0, 1.0], dtype=torch.float64)
+    world_pose = transform @ global_pose
+    assert float(world_pose.abs().max()) < 10.0, world_pose
+
+
+def test_py123d_lidar_sensor_offset_is_a_frame_change_only(mini_log: Path) -> None:
+    """`lidar_sensor_offset` must move points into the sensor frame without moving the world."""
+    torch = pytest.importorskip("torch")
+
+    from nerfstudio.cameras.lidars import LidarType
+    from nerfstudio.data.dataparsers.py123d_dataparser import Py123dDataParser, Py123dDataParserConfig
+
+    offset = (0.0, 0.0, 1.5)
+
+    def parse(lidar_sensor_offset):
+        config = Py123dDataParserConfig(
+            data=mini_log.parents[2],
+            log_id="mini_log_001",
+            split="train",
+            cameras=("CAM_FRONT",),
+            lidars=("LIDAR_TOP",),
+            lidar_type=LidarType.VELODYNE_VLP32C,
+            lidar_sensor_offset=lidar_sensor_offset,
+            train_split_fraction=1.0,
+        )
+        return Py123dDataParser(config).get_dataparser_outputs("train")
+
+    stored_frame = parse((0.0, 0.0, 0.0))
+    sensor_frame = parse(offset)
+
+    offset_tensor = torch.tensor(offset)
+    for stored_pc, sensor_pc in zip(stored_frame.metadata["point_clouds"], sensor_frame.metadata["point_clouds"]):
+        # The points themselves are shifted into the sensor frame...
+        assert torch.allclose(sensor_pc[:, :3], stored_pc[:, :3] - offset_tensor, atol=1e-6)
+
+    def world_points(outputs):
+        """Points in world space, relative to the first camera of that parse.
+
+        Each parse recenters the scene on its own mean pose, so an absolute comparison
+        would only measure that recentering. The cameras are untouched by the lidar
+        offset, so camera 0 is the fixed landmark; the lidar origin is not, since moving
+        it to the physical sensor is the whole point of the config field.
+        """
+        lidar_to_worlds = outputs.metadata["lidars"].lidar_to_worlds
+        anchor = outputs.cameras.camera_to_worlds[0, :3, 3]
+        out = []
+        for idx, pc in enumerate(outputs.metadata["point_clouds"]):
+            rotation = lidar_to_worlds[idx, :3, :3]
+            translation = lidar_to_worlds[idx, :3, 3]
+            out.append(pc[:, :3] @ rotation.T + translation - anchor)
+        return torch.cat(out)
+
+    assert torch.allclose(world_points(sensor_frame), world_points(stored_frame), atol=1e-5)
+
+    # And the default leaves both the points and the poses untouched.
+    default = parse((0.0, 0.0, 0.0))
+    assert torch.allclose(default.metadata["lidars"].lidar_to_worlds, stored_frame.metadata["lidars"].lidar_to_worlds)

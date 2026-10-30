@@ -120,6 +120,23 @@ class Py123dDataParserConfig(ADDataParserConfig):
     """Horizontal lidar beam divergence used for rendering metadata."""
     vertical_beam_divergence: float = 1.5e-3
     """Vertical lidar beam divergence used for rendering metadata."""
+    lidar_sensor_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Translation from the frame the lidar points are *stored* in to the physical sensor origin.
+
+    Some exporters emit a merged-lidar modality whose points have already been transformed into
+    the ego/IMU frame, and then report ``lidar_to_imu_se3`` as identity. That is self-consistent in
+    world space, but neurad derives each point's azimuth/elevation/range from the raw point
+    coordinates and bins the returns into a range image using a physical beam table
+    (``get_lidar_elevation_mapping``). Those angles are only the sensor's beam angles if the
+    points are expressed about the sensor origin, so an ego-frame export silently produces
+    elevations that match no beam table and a scrambled range image.
+
+    Set this to the sensor origin expressed in the stored frame. Points are shifted into the
+    sensor frame and the same translation is folded into ``lidar_to_world``, so world-space
+    geometry is unchanged -- only the spherical binning is corrected. Rotation is deliberately
+    not modeled: a constant yaw is a cyclic shift of a full 360 degree sweep and does not
+    affect which elevation row a return lands in.
+    """
     use_capture_timestamps: bool = True
     """Use per-camera capture timestamps from an optional custom modality sidecar."""
     capture_metadata_modality: str = DEFAULT_CAPTURE_METADATA_MODALITY
@@ -166,6 +183,7 @@ class Py123dDataParser(ADDataParser):
         self._image_tmpdir = None
         self._image_dir: Path = Path()
         self._image_paths: Dict[Tuple[str, int], Path] = {}
+        self._pose_origin = np.zeros(3)
 
     @property
     def actor_transform(self) -> torch.Tensor:
@@ -175,7 +193,54 @@ class Py123dDataParser(ADDataParser):
     def _generate_dataparser_outputs(self, split="train"):
         self._load_arrow_tables()
         self._extract_camera_images()
-        return super()._generate_dataparser_outputs(split)
+        self._pose_origin = self._compute_pose_origin()
+        outputs = super()._generate_dataparser_outputs(split)
+        # ``dataparser_transform`` must still map the *exporter's* global frame into the
+        # neurad world frame, so fold the float64 pre-shift back into it.
+        outputs.dataparser_transform = self._compose_origin_shift(outputs.dataparser_transform)
+        return outputs
+
+    def _compute_pose_origin(self) -> np.ndarray:
+        """Pick a float64 origin to subtract from global poses before they become float32.
+
+        py123d logs are georeferenced: in an ECEF-like global frame the ego translation can be
+        ~3.8e6 m from the origin, where float32 spacing is 0.25 m. Casting poses to
+        float32 in that frame -- which is what ``torch.tensor(..., dtype=torch.float32)``
+        below used to do -- quantizes every camera, lidar and actor pose by up to 0.125 m,
+        independently and incoherently per pose. Measured on one such log: 0.064 m mean
+        and 0.126 m max error, i.e. 5-15 px of reprojection jitter at the depths these
+        cameras actually see. A splat optimizer cannot fit that; it can only blur until the
+        result is equally consistent with all the contradictory poses it was given.
+
+        ``ADDataParser._adjust_poses`` does recenter the scene, but only *after* the cast,
+        so it cannot recover precision that has already been thrown away. Subtracting a
+        constant origin in float64 first keeps the float32 mantissa where it is useful
+        (sub-millimeter at scene scale). The shift is a rigid translation common to every
+        pose, so it changes nothing about the scene except its numerical conditioning.
+        """
+        column_name = next(n for n in self._ego_table.column_names if n.endswith(".imu_se3"))
+        return np.asarray(self._ego_table.column(column_name)[0].as_py()[:3], dtype=np.float64)
+
+    def _recenter(self, pose: np.ndarray) -> np.ndarray:
+        """Return a copy of a 4x4 global pose with the float64 pose origin subtracted."""
+        pose = np.array(pose, dtype=np.float64, copy=True)
+        pose[:3, 3] -= self._pose_origin
+        return pose
+
+    def _compose_origin_shift(self, world_from_shifted: torch.Tensor) -> torch.Tensor:
+        """Compose the float64 pre-shift into a 3x4 transform so it accepts global poses.
+
+        Note the result is still a float32 tensor holding a ~3.8e6 m translation, so it
+        can only express the global -> world mapping to about 0.25 m. That is a property of
+        ``DataparserOutputs.dataparser_transform``'s dtype and was equally true before the
+        pre-shift; it affects only consumers that feed it raw georeferenced coordinates
+        (``scripts/closed_loop/server.py``, ``dataparser_transforms.json``), never the poses
+        used for training, which are now correct to well under a millimeter.
+        """
+        rot = world_from_shifted[:3, :3].double()
+        trans = world_from_shifted[:3, 3].double()
+        origin = torch.from_numpy(self._pose_origin)
+        return torch.cat([rot, (trans - rot @ origin).unsqueeze(-1)], dim=-1).to(world_from_shifted.dtype)
 
     def _load_arrow_tables(self) -> None:
         log_dir = self.config.data / "logs" / self.config.split / self.config.log_id
@@ -232,8 +297,13 @@ class Py123dDataParser(ADDataParser):
 
         # Keep TemporaryDirectory alive for the parser lifetime so images remain
         # readable, then clean up automatically when the parser is discarded.
-        self._image_tmpdir = tempfile.TemporaryDirectory(prefix="py123d_images_")
-        self._image_dir = Path(self._image_tmpdir.name)
+        # Allocate it only once: _load_arrow_tables() runs again for every split,
+        # and rebinding this attribute would drop the previous TemporaryDirectory,
+        # deleting images whose paths were already handed to an earlier split's
+        # DataparserOutputs (train paths die when the eval split is generated).
+        if getattr(self, "_image_tmpdir", None) is None:
+            self._image_tmpdir = tempfile.TemporaryDirectory(prefix="py123d_images_")
+            self._image_dir = Path(self._image_tmpdir.name)
 
     def _extract_camera_images(self) -> None:
         """Extract image payloads for rows referenced by ``sync.arrow``."""
@@ -241,10 +311,12 @@ class Py123dDataParser(ADDataParser):
             modality_key = self._camera_name_to_modality[camera_name]
             table = self._camera_tables[modality_key]
             data_column = modality_data_column(table)
-            needed_rows = {
-                int(self._sync_table.column(modality_key)[sync_row].as_py())
-                for sync_row in iter_sync_rows(self._sync_table)
-            }
+            needed_rows = set()
+            for sync_row in iter_sync_rows(self._sync_table):
+                row_ref = self._sync_table.column(modality_key)[sync_row].as_py()
+                if row_ref is None:
+                    continue  # sample has no frame from this camera; see _get_cameras
+                needed_rows.add(int(row_ref))
             for row_idx in sorted(needed_rows):
                 image_bytes = data_column[row_idx].as_py()
                 if not image_bytes:
@@ -275,8 +347,16 @@ class Py123dDataParser(ADDataParser):
             assert pose_column is not None
 
             for sync_row in iter_sync_rows(self._sync_table):
-                row_idx = int(self._sync_table.column(modality_key)[sync_row].as_py())
-                pose = pose_list_to_matrix(pose_column[row_idx].as_py())
+                row_ref = self._sync_table.column(modality_key)[sync_row].as_py()
+                if row_ref is None:
+                    # sync.arrow leaves a modality's entry null when the sample has no
+                    # data for it -- e.g. the final sample of a snippet, which carries a
+                    # lidar sweep but no images. Skip rather than fail: sensor entries
+                    # are a flat list tagged by sensor_idxs, so per-camera counts may
+                    # legitimately differ.
+                    continue
+                row_idx = int(row_ref)
+                pose = self._recenter(pose_list_to_matrix(pose_column[row_idx].as_py()))
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
                 anchor_ts_us = timestamp_column[row_idx].as_py()
@@ -348,10 +428,16 @@ class Py123dDataParser(ADDataParser):
         ego_column_name = "ego_state_se3"
         for lidar_idx, _lidar_name in enumerate(self.config.lidars):
             for sync_row in iter_sync_rows(self._sync_table):
-                row_idx = int(self._sync_table.column(self._lidar_modality_key)[sync_row].as_py())
-                ego_row_idx = int(self._sync_table.column(ego_column_name)[sync_row].as_py())
+                row_ref = self._sync_table.column(self._lidar_modality_key)[sync_row].as_py()
+                ego_row_ref = self._sync_table.column(ego_column_name)[sync_row].as_py()
+                if row_ref is None or ego_row_ref is None:
+                    continue  # no sweep (or no ego pose) for this sample; see _get_cameras
+                row_idx = int(row_ref)
+                ego_row_idx = int(ego_row_ref)
                 ego_pose = pose_list_to_matrix(ego_pose_column[ego_row_idx].as_py())
-                lidar_pose = ego_pose @ self._lidar_to_imu
+                # Fold the stored-frame -> sensor-origin translation into the pose, so that
+                # shifting the points in _read_lidars leaves world-space geometry identical.
+                lidar_pose = self._recenter(ego_pose @ self._lidar_to_imu @ self._sensor_offset_matrix())
 
                 filenames.append(lidar_row_path(row_idx))
                 poses.append(lidar_pose)
@@ -365,7 +451,11 @@ class Py123dDataParser(ADDataParser):
         lidars = Lidars(
             lidar_to_worlds=poses_tensor[:, :3, :4],
             lidar_type=self.config.lidar_type,
-            assume_ego_compensated=False,
+            # The points are already ego-motion compensated: the producer moves every point to where it
+            # would have been had the whole sweep been captured at the cloud timestamp. Lidars offsets the
+            # ray *origin* by dt * velocity either way, which is correct, but with this flag False it also
+            # offsets the *points*, removing the same ego motion a second time.
+            assume_ego_compensated=True,
             times=times_tensor,
             metadata={"sensor_idxs": idxs_tensor},
             horizontal_beam_divergence=self.config.horizontal_beam_divergence,
@@ -374,8 +464,15 @@ class Py123dDataParser(ADDataParser):
         )
         return lidars, filenames
 
+    def _sensor_offset_matrix(self) -> np.ndarray:
+        """Translation-only transform from the sensor frame to the stored point frame."""
+        offset = np.eye(4)
+        offset[:3, 3] = np.asarray(self.config.lidar_sensor_offset, dtype=np.float64)
+        return offset
+
     def _read_lidars(self, lidars: Lidars, filepaths: List[Path]) -> List[torch.Tensor]:
         point_clouds: List[torch.Tensor] = []
+        offset = torch.tensor(self.config.lidar_sensor_offset, dtype=torch.float32)
         data_column = modality_data_column(self._lidar_table)
         timestamp_column = modality_timestamp_column(self._lidar_table)
         end_timestamp_column = modality_end_timestamp_column(self._lidar_table)
@@ -389,6 +486,12 @@ class Py123dDataParser(ADDataParser):
             # lidar_ipc_to_numpy already returns relative sweep time offsets in
             # [-sweep_duration, 0]; do not subtract absolute lidar timestamps.
             pc = torch.from_numpy(lidar_ipc_to_numpy(data_column[row_idx].as_py(), sweep_duration_s))
+            # Express points about the physical sensor origin so that the azimuth / elevation /
+            # range the lidar rasteriser computes are the sensor's real beam angles. The same
+            # translation is applied to lidar_to_world in _get_lidars, so this is a change of
+            # reference frame only, not of world-space geometry.
+            if torch.any(offset != 0):
+                pc[:, :3] -= offset
             point_clouds.append(pc)
 
         return point_clouds
@@ -418,7 +521,9 @@ class Py123dDataParser(ADDataParser):
                 if not track_token:
                     continue
                 box = bounding_box_se3_from_list(box_values)
-                pose = box.center_se3.transformation_matrix @ WLH_TO_LWH
+                # Boxes are in the same georeferenced global frame as the sensor poses, so
+                # they need the same float64 pre-shift before being cast to float32 below.
+                pose = self._recenter(box.center_se3.transformation_matrix) @ WLH_TO_LWH
                 # neurad dims are documented as wlh; py123d stores length/width/height.
                 wlh = np.array([box.width, box.length, box.height], dtype=np.float32)
                 category = box_label_to_category(self._box_label_class, int(label_value))
